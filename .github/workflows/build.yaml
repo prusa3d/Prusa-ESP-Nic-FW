@@ -1,0 +1,22 @@
+name: ESP UART NIC
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: prusa/upart_nic
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+    - name: Build
+      run: |
+        idf.py all
+    - name: Artifacts
+      uses: actions/upload-artifact@v2
+      with:
+        name: binaries
+        path: |
+          build/partition_table/partition-table.bin
+          build/bootloader/bootloader.bin
+          build/uart_wifi.bin
