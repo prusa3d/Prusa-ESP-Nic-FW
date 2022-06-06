@@ -33,36 +33,16 @@ def convert_bytes(num):
 
 
 def reader():
-    start = datetime.now()
-    cnt = 0
-    while not err_found.is_set():
-        buffer = data.get()
-        read = ser.read(size=len(buffer))
-        if read != buffer:
-            print(f"Read  : {read.hex()}")
-            print(f"Wanted: {buffer.hex()}")
-
-            for i in range(len(buffer)):
-                if buffer[i] != read[i]:
-                    print(
-                        f"Problem at {i}, read: {read[i]:02x}, wanted: {buffer[i]:02x}"
-                    )
-
-            err_found.set()
-        cnt += len(buffer)
-        now = datetime.now()
-        print(
-            f"Read {convert_bytes(cnt)}, {convert_bytes(cnt / (now - start).total_seconds())}/s"
-        )
+    while True:
+        read = ser.readline()
+        print(read.decode())
 
 
 def writer():
-    while not err_found.is_set():
-        buffer = os.urandom(BUFFER_SIZE)
-        data.put(buffer)
-        ser.write(buffer)
-        ser.flushOutput()
-        sleep(0.005)
+    cnt = 0
+    while True:
+        ser.write(cnt.to_bytes(4, 'little', signed=False))
+        cnt += 1
 
 
 Thread(target=reader, daemon=True).start()

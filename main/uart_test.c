@@ -32,6 +32,10 @@
 static const unsigned int BAUDRATE = 1500000;
 #define BUF_SIZE (8192)
 
+static const char *TEST_TAG = "uarttest";\
+
+static const size_t SAMPLES = 1024;
+
 
 static void echo_task(void *arg)
 {
@@ -58,6 +62,46 @@ static void echo_task(void *arg)
     }
 }
 
+static void check_task(void *arg)
+{
+    /* Configure parameters of an UART driver,
+     * communication pins and install the driver */
+    uart_config_t uart_config = {
+        .baud_rate = BAUDRATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, BUF_SIZE * 2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &uart_config));
+
+    portENABLE_INTERRUPTS();
+
+    uint32_t last_data = 0;
+    
+    for(;;) {
+        uint32_t *data = malloc(sizeof(uint32_t) * SAMPLES);
+        void *hog = malloc(last_data);
+
+        int len = uart_read_bytes(UART_NUM_0, data, sizeof(uint32_t) * SAMPLES, portMAX_DELAY);
+
+        for(unsigned int i = 0; i < len / sizeof(uint32_t); ++i) {
+            if(data[i] != last_data + 1) {
+                ESP_LOGI(TEST_TAG, "Read inconsistent %d != %d", data[i], last_data + 1);
+            } else if(data[i] % 100000 == 0) {
+                ESP_LOGI(TEST_TAG, "Read ok %d", data[i]);
+            }
+            last_data = data[i];
+        }
+
+        free(data);
+        free(hog);
+    }
+}
+
 void app_main() {
-    xTaskCreate(echo_task, "uart_echo_task", 4096, NULL, tskIDLE_PRIORITY, NULL);
+    // xTaskCreate(echo_task, "uart_echo_task", 4096, NULL, tskIDLE_PRIORITY, NULL);
+    xTaskCreate(check_task, "uart_check_task", 4096, NULL, tskIDLE_PRIORITY, NULL);
 }
