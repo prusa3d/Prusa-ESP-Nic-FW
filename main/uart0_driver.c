@@ -15,6 +15,9 @@
 #include "esp8266/pin_mux_register.h"
 #include "esp8266/uart_register.h"
 #include "esp8266/uart_struct.h"
+#include "esp_log.h"
+#include <stdbool.h>
+#include <stdatomic.h>
 
 const uint32_t rxfifo_full_thresh = 96;
 const uint32_t rx_timeout_thresh = 16;
@@ -28,6 +31,12 @@ static size_t tx_size;
 static TaskHandle_t rx_task_handle; // task to be notified after uart0_isr() finishes receive
 static uint8_t *rx_data;
 static size_t rx_size;
+
+static atomic_bool pending_frm_err = false;
+static atomic_bool pending_parity_err = false;
+static atomic_bool pending_rxfifo_ovf = false;
+
+static const char *TAG = "uart_driver";
 
 #define FORCE_INLINE inline __attribute__((always_inline))
 
@@ -51,6 +60,9 @@ static void IRAM_ATTR uart0_isr(void *param) {
     //   * RX FIFO full  - happens when RX FIFO has more than `rxfifo_full_thresh` bytes
     //   * RX timeout    - happens when no byte is received for the duration of time it
     //                     would normally take to receive `rx_timeout_thresh` bytes
+    //   * Frame error   - is only logged TODO: Some action should be taken
+    //   * Parity error  - is only logged TODO: Some action should be taken
+    //   * RX FIFO ovf   - is only logged TODO: Some action should be taken
     // The handler is structured as a loop, to account for new conditions arising while
     // processing previous conditions.
     BaseType_t task_woken = pdFALSE;
@@ -82,7 +94,10 @@ static void IRAM_ATTR uart0_isr(void *param) {
                 vTaskNotifyGiveFromISR(tx_task_handle, &task_woken);
             }
             uart0.int_clr.txfifo_empty = 1;
-        } else if (uart_intr_status & (UART_RXFIFO_FULL_INT_ST_M|UART_RXFIFO_TOUT_INT_ST_M)) {
+            continue;
+        }
+
+        if (uart_intr_status & (UART_RXFIFO_FULL_INT_ST_M|UART_RXFIFO_TOUT_INT_ST_M)) {
             // Handle RX FIFO empty and RX timeout conditions.
 
             const uint8_t rx_fifo_cnt = uart0.status.rxfifo_cnt;
@@ -101,12 +116,30 @@ static void IRAM_ATTR uart0_isr(void *param) {
             }
             uart0.int_clr.rxfifo_full = 1;
             uart0.int_clr.rxfifo_tout = 1;
-        } else {
-            // Note: This should never happen in current setup, other interrupts are not enabled.
-            //       But just to be sure and to prevent infinite loop, let's clear the status bit.
-            // TODO: Think more about overflows, frame errors and such.
-            uart0.int_clr.val = uart_intr_status;
+            continue;
         }
+
+        if (uart_intr_status & UART_FRM_ERR_INT_ST_M) {
+            pending_frm_err = true;
+            uart0.int_clr.frm_err = 1;
+            continue;
+        }
+
+        if (uart_intr_status & UART_PARITY_ERR_INT_ST_M) {
+            pending_parity_err = true;
+            uart0.int_clr.parity_err = 1;
+            continue;
+        }
+
+        if (uart_intr_status & UART_RXFIFO_OVF_INT_ST_M) {
+            pending_rxfifo_ovf = true;
+            uart0.int_clr.rxfifo_ovf = 1;
+            continue;
+        }
+
+        // Note: This should never happen in current setup, other interrupts are not enabled.
+        //       But just to be sure and to prevent infinite loop, let's clear the status bit.
+        uart0.int_clr.val = uart_intr_status;
     }
 }
 
@@ -141,6 +174,9 @@ void IRAM_ATTR uart0_rx_bytes(uint8_t *data, size_t size) {
         taskENTER_CRITICAL();
         uart0.int_ena.rxfifo_full = 1;
         uart0.int_ena.rxfifo_tout = 1;
+        uart0.int_ena.parity_err = 1;
+        uart0.int_ena.frm_err = 1;
+        uart0.int_ena.rxfifo_ovf = 1;
         taskEXIT_CRITICAL();
 
         // wait for interrupt handler and we are done
@@ -148,6 +184,20 @@ void IRAM_ATTR uart0_rx_bytes(uint8_t *data, size_t size) {
     } else {
         // load complete data from fifo and we are done
         (void)uart0_rx_fifo(data, size);
+    }
+
+    // Report problems that emerged during the transfer.
+    if(pending_frm_err) {
+        pending_frm_err = false;
+        ESP_LOGE(TAG, "UART0 frame error");
+    }
+    if (pending_parity_err) {
+        pending_parity_err = false;
+        ESP_LOGE(TAG, "UART0 parity error");
+    }
+    if(pending_rxfifo_ovf) {
+        pending_rxfifo_ovf = false;
+        ESP_LOGE(TAG, "UART0 RX FIFO overflow");
     }
 }
 
