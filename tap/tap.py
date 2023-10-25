@@ -115,11 +115,12 @@ send_lock = Lock()
 
 def send_message(msg_type, msg_byte, payload: bytes):
     with send_lock:
-        ser.write(INTRON
+        message = bytes(INTRON
             + msg_type.to_bytes(1, byteorder='big', signed=False)
             + msg_byte.to_bytes(1, byteorder='big', signed=False)
             + len(payload).to_bytes(2, byteorder='big', signed=False)
             + payload)
+        ser.write(message)
         try:
             ser.flush()
         except Exception:
