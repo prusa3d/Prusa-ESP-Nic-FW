@@ -163,7 +163,7 @@ void IRAM_ATTR uart0_tx_bytes(uint8_t *data, size_t size) {
     }
 }
 
-void IRAM_ATTR uart0_rx_bytes(uint8_t *data, size_t size) {
+bool IRAM_ATTR uart0_rx_bytes(uint8_t *data, size_t size) {
     const uint8_t rx_fifo_cnt = uart0.status.rxfifo_cnt;
     if (size > rx_fifo_cnt) {
         // load partial data from fifo
@@ -190,15 +190,20 @@ void IRAM_ATTR uart0_rx_bytes(uint8_t *data, size_t size) {
     if(pending_frm_err) {
         pending_frm_err = false;
         ESP_LOGE(TAG, "UART0 frame error");
+        return false;
     }
     if (pending_parity_err) {
         pending_parity_err = false;
         ESP_LOGE(TAG, "UART0 parity error");
+        return false;
     }
     if(pending_rxfifo_ovf) {
         pending_rxfifo_ovf = false;
         ESP_LOGE(TAG, "UART0 RX FIFO overflow");
+        return false;
     }
+
+    return true;
 }
 
 esp_err_t uart0_driver_install(TaskHandle_t uart0_rx_task_handle, TaskHandle_t uart0_tx_task_handle) {

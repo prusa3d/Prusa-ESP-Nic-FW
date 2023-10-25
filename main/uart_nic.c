@@ -66,6 +66,8 @@ static const uint32_t INACTIVE_PACKET_SECONDS = 5;
 #define MSG_CLIENTCONFIG_V2 6
 #define MSG_PACKET_V2 7
 
+static const char *TAG = "uart_nic";
+
 struct __attribute__((packed)) header {
     uint8_t type;
     union {
@@ -102,13 +104,13 @@ static QueueHandle_t uart0_rx_queue = 0;
 static void uart0_rx_skip_bytes(size_t size) {
     uint8_t c;
     for (uint32_t i = 0; i < size; ++i) {
-        uart0_rx_bytes(&c, 1);
+        if(!uart0_rx_bytes(&c, 1)) {
+            ESP_LOGE(TAG, "Error reading skip byte");
+        }
     }
 }
 
 static const uint8_t uart_nic_protocol = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
-
-static const char *TAG = "uart_nic";
 
 static int s_retry_num = 0;
 
@@ -304,17 +306,24 @@ static void IRAM_ATTR send_device_info() {
     }
 }
 
-static void IRAM_ATTR wait_for_intron() {
+static bool IRAM_ATTR wait_for_intron() {
     // Hope for the best...
     uint8_t intron[8];
-    uart0_rx_bytes(intron, 8);
+    if(!uart0_rx_bytes(intron, 8)) {
+        ESP_LOGE(TAG, "Error reading intron bytes");
+        return false;
+    }
     while (memcmp(intron, tx_message.intron, 8) != 0) {
         // ...but be prepared for the worst.
         for (int i = 0; i < 7; ++i) {
             intron[i] = intron[i+1];
         }
-        uart0_rx_bytes(&intron[7], 1);
+        if(!uart0_rx_bytes(&intron[7], 1)) {
+            ESP_LOGE(TAG, "Error reading intron byte");
+            return false;
+        }
     }
+    return true;
 }
 
 static int IRAM_ATTR get_link_status() {
@@ -404,9 +413,15 @@ static void IRAM_ATTR check_online_status() {
 }
 
 static void IRAM_ATTR read_message() {
-    wait_for_intron();
+    if(!wait_for_intron()) {
+        ESP_LOGE(TAG, "Dropping Rx due to intron read error.");
+        return; // Failed to read intron, skip this message, note an overrun during intron means followup data are corrupted
+    }
     struct header header;
-    uart0_rx_bytes((uint8_t*)&header, sizeof(header));
+    if(!uart0_rx_bytes((uint8_t*)&header, sizeof(header))) {
+        ESP_LOGE(TAG, "Dropping Rx header due to read error.");
+        return; // Failed to read header, skip this message, note an overrun during header means followup data are corrupted
+    }
 
     struct uart0_rx_queue_item queue_item;
     switch (header.type) {
@@ -424,20 +439,23 @@ static void IRAM_ATTR read_message() {
     }
 
     queue_item.size = ntohs(header.size);
-    if (queue_item.size != 0 && queue_item.size <= 2000) {
-        queue_item.data = malloc(queue_item.size);
-        if (queue_item.data) {
-            uart0_rx_bytes(queue_item.data, queue_item.size);
-        } else {
-            uart0_rx_skip_bytes(queue_item.size);
-        }
+    bool read_ok = true;
+    if (queue_item.size != 0 && queue_item.size <= 2000 && (queue_item.data = malloc(queue_item.size))) {
+        read_ok = uart0_rx_bytes(queue_item.data, queue_item.size);
     } else {
         queue_item.data = NULL;
         uart0_rx_skip_bytes(queue_item.size);
     }
 
-    if (xQueueSendToBack(uart0_rx_queue, &queue_item, 0) != pdTRUE) {
-        ESP_LOGE(TAG, "xQueueSendToBack failed (uart0rx)");
+    if(read_ok) {
+        if (xQueueSendToBack(uart0_rx_queue, &queue_item, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "xQueueSendToBack failed (uart0rx)");
+            if (queue_item.data) {
+                free(queue_item.data);
+            }
+        }
+    } else {
+        ESP_LOGE(TAG, "Dropping Rx data due to read error.");
         if (queue_item.data) {
             free(queue_item.data);
         }
