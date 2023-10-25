@@ -84,7 +84,7 @@ def recv_link(up_data):
 def recv_packet():
     global last_in
     up = ser.read(1)
-    recv_link(up_data)
+    recv_link(up)
     size = int.from_bytes(ser.read(2), byteorder='big', signed=False)
     if size:
         packet = ser.read(size)
@@ -127,7 +127,7 @@ def send_message(msg_type, msg_byte, payload: bytes):
 
 def recv_devinfo():
     # ESP FW version
-    version = int.from_bytes(ser.read(2), byteorder='big', signed=False)
+    version = int.from_bytes(ser.read(1), byteorder='big', signed=False)
     size = int.from_bytes(ser.read(2), byteorder='big', signed=False)
     print(f"TAP: ESP FW version: {version}")
 
