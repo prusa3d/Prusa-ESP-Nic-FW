@@ -71,10 +71,11 @@ def wait_for_intron():
 def recv_link(up_data):
     global link_up
     up = int.from_bytes(up_data, byteorder='big', signed=False) == 1
-    link_up = up
-    word = "up" if up else "down"
-    print(f"TAP: Setting link {word}")
-    os.system(f"ip link set {INTERFACE} {word}")
+    if link_up != up:
+        link_up = up
+        word = "up" if up else "down"
+        print(f"TAP: Setting link {word}")
+        os.system(f"ip link set {INTERFACE} {word}")
 
     if not up:
         send_wifi_client()
