@@ -25,13 +25,13 @@ MSG_PACKET_V2 = 7
 INTRON = b"UN\x00\x01\x02\x03\x04\x05"
 INTERFACE = "tap0"
 SERIAL = sys.argv[1] if len(sys.argv) == 2 else "/dev/ttyUSB0"
-BAUD_RATE = 4600000 #921600
+BAUD_RATE = 4647059
 SSID = "esptest"
 PASS = "lwesp8266"
-MTU = 1420
+MTU = 1500
 
-# tap = Path('/dev/net/tun').open('r+b')
-tap = os.open("/dev/net/tun", 0x2)
+tap = os.open('/dev/net/tun', os.O_RDWR)
+# tap = os.open("/dev/net/tun", 0x2)
 
 ifr = struct.pack(b"16sH", INTERFACE.encode("ascii"), IFF_TAP | IFF_NO_PI)
 fcntl.ioctl(tap, TUNSETIFF, ifr)
@@ -55,6 +55,7 @@ link_up = False
 def wait_for_intron():
     # print("TAP: Waiting for intron")
     pos = 0
+    failed = False
     while pos < len(INTRON):
         c = ser.read(1)[0]
         if c == INTRON[pos]:
@@ -62,10 +63,13 @@ def wait_for_intron():
             # print(f"TAP: INTRON: pos: {pos}, byte: {bytes([c])}")
             #print("I", end="", flush=True)
         else:
-            print(f"{safe(bytes([c]))}", end="")
+            # print(f"{safe(bytes([c]))}", end="")
             pos = 0
+            failed = True
             #print("X", end="", flush=True)
     # print("TAP: intron found")
+    if failed:
+        print("TAP: intron found after failure")
 
 
 def recv_link(up_data):
@@ -182,7 +186,7 @@ send_wifi_client()
 
 print("TAP: Reading tap device")
 while True:
-    packet = os.read(tap, 1024)
+    packet = os.read(tap, MTU + 18) # 18 is ethernet header overhead
     # print(f"TAP: SOUT: {packet.hex()}, LEN: {len(packet)}")
 
     send_message(MSG_PACKET_V2, 0, packet)
