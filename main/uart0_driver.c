@@ -9,28 +9,30 @@
 //
 // Copyright (C) 2023 Prusa Research a.s - www.prusa3d.com
 // SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "uart0_driver.h"
 
 #include "driver/uart.h"
 #include "esp8266/pin_mux_register.h"
 #include "esp8266/uart_register.h"
 #include "esp8266/uart_struct.h"
+#include "esp_attr.h"
 #include "esp_log.h"
+#include "projdefs.h"
+#include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <string.h>
+#include <arpa/inet.h>
 
 const uint32_t rxfifo_full_thresh = 96;
 const uint32_t rx_timeout_thresh = 16;
 const uint32_t txfifo_empty_thresh = 32;
-const uint32_t baud_rate = 4600000;
+const uint32_t baud_rate = 4608000;
 
 static TaskHandle_t tx_task_handle; // task to be notified after uart0_isr() finishes transmit
 static uint8_t *tx_data;
 static size_t tx_size;
-
-static TaskHandle_t rx_task_handle; // task to be notified after uart0_isr() finishes receive
-static uint8_t *rx_data;
-static size_t rx_size;
 
 static atomic_bool pending_frm_err = false;
 static atomic_bool pending_parity_err = false;
@@ -53,6 +55,8 @@ static FORCE_INLINE uint8_t *uart0_tx_fifo(uint8_t* data, size_t size) {
     }
     return data;
 }
+
+static void read_fifo();
 
 static void IRAM_ATTR uart0_isr(void *param) {
     // This ISR handles all UART0 conditions:
@@ -98,22 +102,7 @@ static void IRAM_ATTR uart0_isr(void *param) {
         }
 
         if (uart_intr_status & (UART_RXFIFO_FULL_INT_ST_M|UART_RXFIFO_TOUT_INT_ST_M)) {
-            // Handle RX FIFO empty and RX timeout conditions.
-
-            const uint8_t rx_fifo_cnt = uart0.status.rxfifo_cnt;
-            if (rx_size > rx_fifo_cnt) {
-                // Load partial data from fifo, do some bookkeeping and keep interrupt enabled.
-                rx_data = uart0_rx_fifo(rx_data, rx_fifo_cnt);
-                rx_size -= rx_fifo_cnt;
-            } else {
-                // Load complete data from fifo. Note that we do not need any more bookkeeping.
-                (void)uart0_rx_fifo(rx_data, rx_size);
-
-                // Disable more interrupts and unblock uart0_rx_bytes().
-                uart0.int_ena.rxfifo_full = 0;
-                uart0.int_ena.rxfifo_tout = 0;
-                vTaskNotifyGiveFromISR(rx_task_handle, &task_woken);
-            }
+            read_fifo();
             uart0.int_clr.rxfifo_full = 1;
             uart0.int_clr.rxfifo_tout = 1;
             continue;
@@ -163,59 +152,132 @@ void IRAM_ATTR uart0_tx_bytes(uint8_t *data, size_t size) {
     }
 }
 
-bool IRAM_ATTR uart0_rx_bytes(uint8_t *data, size_t size) {
-    const uint8_t rx_fifo_cnt = uart0.status.rxfifo_cnt;
-    if (size > rx_fifo_cnt) {
-        // load partial data from fifo
-        rx_data = uart0_rx_fifo(data, rx_fifo_cnt);
-        rx_size = size - rx_fifo_cnt;
+static uint8_t intron_pos = 0;
 
-        // delegate rest of the work to interrupt handler
-        taskENTER_CRITICAL();
-        uart0.int_ena.rxfifo_full = 1;
-        uart0.int_ena.rxfifo_tout = 1;
-        uart0.int_ena.parity_err = 1;
-        uart0.int_ena.frm_err = 1;
-        uart0.int_ena.rxfifo_ovf = 1;
-        taskEXIT_CRITICAL();
+static uint8_t intron[8];
 
-        // wait for interrupt handler and we are done
-        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    } else {
-        // load complete data from fifo and we are done
-        (void)uart0_rx_fifo(data, size);
+
+QueueHandle_t empty_buffer_queue;
+QueueHandle_t full_buffer_queue;
+
+BaseType_t IRAM_ATTR handle_fifo_byte(const char c) {
+    static RxBuffer *rx_buffer = NULL;
+    static size_t rx_buffer_pos = 0;
+    static size_t rx_buffer_size = 0;
+
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    // Obtain buffer, skip if none available
+    if(!rx_buffer && !xQueueReceiveFromISR( empty_buffer_queue, &rx_buffer, &xHigherPriorityTaskWoken)) {
+        return xHigherPriorityTaskWoken;
     }
+
+    // Handle intron (TODO: Use Trie)
+    if(intron_pos < sizeof(intron)) {
+        if(c == intron[intron_pos]) {
+            intron_pos++;
+        } else {
+            intron_pos = 0;
+        }
+
+        // Move to next state
+        if(intron_pos == sizeof(intron)) {
+            rx_buffer_pos = 0;
+            rx_buffer_size = sizeof(struct Header);
+        }
+        return xHigherPriorityTaskWoken;
+    }
+
+    // Read byte into buffer
+    ((char*)rx_buffer)[rx_buffer_pos++] = c;
+
+    // Process size from header when available
+    if(rx_buffer_pos == sizeof(struct Header)) {
+        size_t size = ntohs(rx_buffer->header.size);
+        if(size < MAX_PACKET_SIZE) {
+            rx_buffer_size += size; // Schedule message body read
+        } else {
+            intron_pos = 0; // Skip this message
+        }
+    }
+
+    // Dispatch buffer and reset state when full
+    if(rx_buffer_pos == rx_buffer_size) {
+        if(xQueueSendToBackFromISR(full_buffer_queue, &rx_buffer, &xHigherPriorityTaskWoken)) {
+            rx_buffer = NULL;
+        }
+        intron_pos = 0;
+    }
+
+    return xHigherPriorityTaskWoken;
+}
+
+void IRAM_ATTR read_fifo() {
+    while(uart0.status.rxfifo_cnt) {
+        BaseType_t xHigherPriorityTaskWoken = handle_fifo_byte(uart0.fifo.rw_byte);
+        if( xHigherPriorityTaskWoken ) {
+            portYIELD_FROM_ISR ();
+        }
+    }
+}
+
+void IRAM_ATTR uart0_rx_release_buffer(RxBuffer *buffer) {
+    xQueueSendToBack( empty_buffer_queue, &buffer, portMAX_DELAY );
+}
+
+RxBuffer* IRAM_ATTR uart0_rx_get_buffer() {
+    RxBuffer *buffer;
+    xQueueReceive( full_buffer_queue, &buffer, portMAX_DELAY );
+    // uart1.fifo.rw_byte = '*';
 
     // Report problems that emerged during the transfer.
     if(pending_frm_err) {
         pending_frm_err = false;
         ESP_LOGE(TAG, "UART0 frame error");
-        return false;
     }
     if (pending_parity_err) {
         pending_parity_err = false;
         ESP_LOGE(TAG, "UART0 parity error");
-        return false;
     }
     if(pending_rxfifo_ovf) {
         pending_rxfifo_ovf = false;
         ESP_LOGE(TAG, "UART0 RX FIFO overflow");
-        return false;
     }
 
-    return true;
+    return buffer;
 }
 
-esp_err_t uart0_driver_install(TaskHandle_t uart0_rx_task_handle, TaskHandle_t uart0_tx_task_handle) {
+void IRAM_ATTR uart0_set_intron(uint8_t new_intron[8]) {
+    memcpy(intron, new_intron, sizeof(intron));
+}
+
+static uint32_t round_div(uint32_t a, uint32_t b) {
+    return (a + b/2) / b;
+}
+
+esp_err_t uart0_driver_install(TaskHandle_t uart0_tx_task_handle) {
     if (uart_is_driver_installed(UART_NUM_0)) {
         return ESP_FAIL;
+    }
+
+    // Rx, Tx queues
+    empty_buffer_queue = xQueueCreate( 10, sizeof(RxBuffer*));
+    assert(empty_buffer_queue);
+    full_buffer_queue = xQueueCreate( 10, sizeof(RxBuffer*));
+    assert(full_buffer_queue);
+
+    // Allocate Tx buffers
+    for(int _ = 0; _ < 3; _++) {
+        RxBuffer *buffer = malloc(sizeof(RxBuffer));
+        assert(buffer);
+        xQueueSendToBack( empty_buffer_queue, &buffer, portMAX_DELAY );
     }
 
     portENTER_CRITICAL();
     PIN_PULLUP_DIS(PERIPHS_IO_MUX_U0TXD_U);
     PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0RXD_U, FUNC_U0RXD);
     PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0TXD_U, FUNC_U0TXD);
-    uart0.clk_div.val = (uint32_t)(UART_CLK_FREQ / baud_rate) & 0xFFFFF;
+    uart0.clk_div.val = round_div(UART_CLK_FREQ, baud_rate) & 0xFFFFF;
     uart0.conf0.bit_num = UART_DATA_8_BITS;
     uart0.conf0.parity = (UART_PARITY_DISABLE & 0x1);
     uart0.conf0.parity_en = ((UART_PARITY_DISABLE >> 1) & 0x1);
@@ -233,10 +295,17 @@ esp_err_t uart0_driver_install(TaskHandle_t uart0_rx_task_handle, TaskHandle_t u
         return ESP_FAIL;
     }
 
-    rx_task_handle = uart0_rx_task_handle;
     tx_task_handle = uart0_tx_task_handle;
     xTaskNotifyGive(tx_task_handle);
-    xTaskNotifyGive(rx_task_handle);
+
+    taskENTER_CRITICAL();
+    uart0.int_ena.rxfifo_full = 1;
+    uart0.int_ena.rxfifo_tout = 1;
+    uart0.int_ena.parity_err = 1;
+    uart0.int_ena.frm_err = 1;
+    uart0.int_ena.rxfifo_ovf = 1;
+    taskEXIT_CRITICAL();
+
 
     return ESP_OK;
 }

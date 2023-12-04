@@ -20,6 +20,7 @@
   SPDX-License-Identifier: GPL-3.0-or-later 
 */
 
+#include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -36,6 +37,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include "rom/ets_sys.h"
 #include "uart0_driver.h"
 
 #include "esp_private/wifi.h"
@@ -89,26 +91,7 @@ struct uart0_tx_queue_item {
                      //       sure if we can free before data is transmitted.
 };
 static QueueHandle_t uart0_tx_queue = NULL;
-
-// Note: `uart0_rx_queue` is a FreeRTOS queue of `uart0_rx_queue_item` elements.
-//       Items are send to this queue from realtime priority task `uart0_rx_task`
-//       whenever they are received via UART0 by ESP from the printer. The queue
-//       is drained by lower priority task `main_task`.
-struct uart0_rx_queue_item {
-    void (*callback)(uint8_t*, size_t);
-    uint8_t *data;
-    size_t size;
-};
-static QueueHandle_t uart0_rx_queue = 0;
-
-static void uart0_rx_skip_bytes(size_t size) {
-    uint8_t c;
-    for (uint32_t i = 0; i < size; ++i) {
-        if(!uart0_rx_bytes(&c, 1)) {
-            ESP_LOGE(TAG, "Error reading skip byte");
-        }
-    }
-}
+static QueueHandle_t uart0_rx_queue = NULL;
 
 static const uint8_t uart_nic_protocol = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
 
@@ -306,26 +289,6 @@ static void IRAM_ATTR send_device_info() {
     }
 }
 
-static bool IRAM_ATTR wait_for_intron() {
-    // Hope for the best...
-    uint8_t intron[8];
-    if(!uart0_rx_bytes(intron, 8)) {
-        ESP_LOGE(TAG, "Error reading intron bytes");
-        return false;
-    }
-    while (memcmp(intron, tx_message.intron, 8) != 0) {
-        // ...but be prepared for the worst.
-        for (int i = 0; i < 7; ++i) {
-            intron[i] = intron[i+1];
-        }
-        if(!uart0_rx_bytes(&intron[7], 1)) {
-            ESP_LOGE(TAG, "Error reading intron byte");
-            return false;
-        }
-    }
-    return true;
-}
-
 static int IRAM_ATTR get_link_status() {
     static wifi_ap_record_t ap_info;
     esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);
@@ -335,22 +298,24 @@ static int IRAM_ATTR get_link_status() {
     return online;
 }
 
-static void IRAM_ATTR handle_rx_msg_packet_v2(uint8_t* data, size_t size) {
+static void IRAM_ATTR handle_rx_msg_packet_v2(RxBuffer *buffer, size_t size) {
     if (size == 0) {
         send_link_status(get_link_status());
     } else {
-        esp_wifi_internal_tx(ESP_IF_WIFI_STA, data, size);
-        free(data);
+        esp_wifi_internal_tx(ESP_IF_WIFI_STA, buffer->data, size);
+        uart0_rx_release_buffer(buffer);
     }
 }
 
-static void IRAM_ATTR handle_rx_msg_clientconfig_v2(uint8_t* data, size_t size) {
+static void IRAM_ATTR handle_rx_msg_clientconfig_v2(RxBuffer *buffer, size_t size) {
     wifi_config_t wifi_config;
     memset(&wifi_config, 0, sizeof(wifi_config_t));
+    uint8_t *data = buffer->data;
 
     {
         taskENTER_CRITICAL();
         memcpy(tx_message.intron, data, sizeof(tx_message.intron));
+        uart0_set_intron(tx_message.intron);
         taskEXIT_CRITICAL();
         data += sizeof(tx_message.intron);
     }
@@ -385,10 +350,12 @@ static void IRAM_ATTR handle_rx_msg_clientconfig_v2(uint8_t* data, size_t size) 
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
     ESP_ERROR_CHECK(esp_wifi_start());
     send_device_info();
+
+    uart0_rx_release_buffer(buffer);
 }
 
-static void IRAM_ATTR handle_rx_msg_unknown(uint8_t* data, size_t size) {
-    free(data);
+static void IRAM_ATTR handle_rx_msg_unknown(RxBuffer *buffer, size_t size) {
+    uart0_rx_release_buffer(buffer);
 }
 
 static void IRAM_ATTR check_online_status() {
@@ -413,59 +380,17 @@ static void IRAM_ATTR check_online_status() {
 }
 
 static void IRAM_ATTR read_message() {
-    if(!wait_for_intron()) {
-        ESP_LOGE(TAG, "Dropping Rx due to intron read error.");
-        return; // Failed to read intron, skip this message, note an overrun during intron means followup data are corrupted
-    }
-    struct header header;
-    if(!uart0_rx_bytes((uint8_t*)&header, sizeof(header))) {
-        ESP_LOGE(TAG, "Dropping Rx header due to read error.");
-        return; // Failed to read header, skip this message, note an overrun during header means followup data are corrupted
-    }
+    // ESP_LOGE(TAG, "Waiting for full rx buffer");
+    RxBuffer *rx_buffer = uart0_rx_get_buffer();
+    // ESP_LOGE(TAG, "Got buffer");
 
-    struct uart0_rx_queue_item queue_item;
-    switch (header.type) {
-    case MSG_PACKET_V2:
-        queue_item.callback = handle_rx_msg_packet_v2;
-        break;
-    case MSG_CLIENTCONFIG_V2:
-        queue_item.callback = handle_rx_msg_clientconfig_v2;
-        break;
-    case MSG_DEVINFO_V2:
-        // this should never happen, this message type is only transmitted, never received
-    default:
-        queue_item.callback = handle_rx_msg_unknown;
-        break;
-    }
-
-    queue_item.size = ntohs(header.size);
-    bool read_ok = true;
-    if (queue_item.size != 0 && queue_item.size <= 2000 && (queue_item.data = malloc(queue_item.size))) {
-        read_ok = uart0_rx_bytes(queue_item.data, queue_item.size);
-    } else {
-        queue_item.data = NULL;
-        uart0_rx_skip_bytes(queue_item.size);
-    }
-
-    if(read_ok) {
-        if (xQueueSendToBack(uart0_rx_queue, &queue_item, 0) != pdTRUE) {
-            ESP_LOGE(TAG, "xQueueSendToBack failed (uart0rx)");
-            if (queue_item.data) {
-                free(queue_item.data);
-            }
-        }
-    } else {
-        ESP_LOGE(TAG, "Dropping Rx data due to read error.");
-        if (queue_item.data) {
-            free(queue_item.data);
-        }
+    if (xQueueSendToBack(uart0_rx_queue, &rx_buffer, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "xQueueSendToBack failed (uart0rx)");
+        uart0_rx_release_buffer(rx_buffer);
     }
 }
 
 static void IRAM_ATTR uart0_rx_task(void *arg) {
-    // wait for uart0_driver_install() to finish
-    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
     for (;;) {
         read_message();
     }
@@ -479,9 +404,22 @@ static void IRAM_ATTR main_task(void* arg) {
     send_device_info();
 
     for (;;) {
-        struct uart0_rx_queue_item queue_item;
-        if (xQueueReceive(uart0_rx_queue, &queue_item, portMAX_DELAY) == pdTRUE) {
-            (*queue_item.callback)(queue_item.data, queue_item.size);
+        RxBuffer *rx_buffer;
+        if (xQueueReceive(uart0_rx_queue, &rx_buffer, portMAX_DELAY) == pdTRUE) {
+            switch (rx_buffer->header.type) {
+            case MSG_PACKET_V2:
+                handle_rx_msg_packet_v2(rx_buffer, ntohs(rx_buffer->header.size));
+                break;
+            case MSG_CLIENTCONFIG_V2:
+                handle_rx_msg_clientconfig_v2(rx_buffer, ntohs(rx_buffer->header.size));
+                break;
+            case MSG_DEVINFO_V2:
+                // this should never happen, this message type is only transmitted, never received
+            default:
+                handle_rx_msg_unknown(rx_buffer, ntohs(rx_buffer->header.size));
+                break;
+            }
+
             check_online_status();
         }
     }
@@ -510,7 +448,7 @@ static void IRAM_ATTR uart0_tx_task(void *arg) {
                     free(queue_item.data);
                 }
                 if (queue_item.rx_buffer) {
-                    free(queue_item.rx_buffer);
+                    esp_wifi_internal_free_rx_buffer(queue_item.rx_buffer);
                 }
             } break;
             case MSG_DEVINFO_V2:
@@ -536,7 +474,7 @@ void IRAM_ATTR app_main() {
     wifi_init_sta();
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    uart0_rx_queue = xQueueCreate(20, sizeof(struct uart0_rx_queue_item));
+    uart0_rx_queue = xQueueCreate(20, sizeof(RxBuffer*));
     if (uart0_rx_queue == 0) {
         ESP_LOGE(TAG, "xQueueCreate failed (uart0rx)");
         abort();
@@ -546,20 +484,24 @@ void IRAM_ATTR app_main() {
         ESP_LOGE(TAG, "xQueueCreate failed (uart0tx)");
         abort();
     }
-    TaskHandle_t uart0_rx_task_handle;
+
     TaskHandle_t uart0_tx_task_handle;
-    if (xTaskCreate(uart0_rx_task, "uart0rx", 1024, NULL, 14, &uart0_rx_task_handle) != pdPASS) {
-        ESP_LOGE(TAG, "xTaskCreate failed (uart0rx)");
-        abort();
-    }
     if (xTaskCreate(uart0_tx_task, "uart0tx", 1024, NULL, 14, &uart0_tx_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate failed (uart0tx)");
         abort();
     }
-    if (uart0_driver_install(uart0_rx_task_handle, uart0_tx_task_handle) != ESP_OK) {
+
+    if (uart0_driver_install(uart0_tx_task_handle) != ESP_OK) {
         ESP_LOGE(TAG, "uart0_driver_install failed");
         abort();
     }
+    uart0_set_intron(tx_message.intron);
+
+    if (xTaskCreate(uart0_rx_task, "uart0rx", 1024, NULL, 14, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate failed (uart0rx)");
+        abort();
+    }
+
     if (xTaskCreate(main_task, "main", 2048, NULL, 12, NULL) != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate failed (main)");
         abort();
