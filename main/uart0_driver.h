@@ -11,6 +11,17 @@
 
 #define MAX_PACKET_SIZE 2048
 
+#ifdef CONFIG_IDF_TARGET_ESP8266
+extern int critical_mutex;
+#define custom_taskENTER_CRITICAL(m) taskENTER_CRITICAL()
+#define custom_taskEXIT_CRITICAL(m) taskEXIT_CRITICAL()
+#endif
+#ifdef CONFIG_IDF_TARGET_ESP32
+extern portMUX_TYPE critical_mutex;
+#define custom_taskENTER_CRITICAL(m) taskENTER_CRITICAL(m)
+#define custom_taskEXIT_CRITICAL(m) taskEXIT_CRITICAL(m)
+#endif
+
 // Register custom UART0 driver.
 // For description of `uart0_tx_task_handle` parameters, see documentation of `uart0_tx_bytes()` function.
 esp_err_t uart0_driver_install(TaskHandle_t uart0_tx_task_handle);
@@ -44,7 +55,7 @@ struct __attribute__((packed)) Header {
  * The user is supposed to obtain filled buffers with uart0_rx_get_buffer() and return them back with uart0_rx_release_buffer() once
  * processed by the application.
  */
-typedef struct __attribute__((packed)){
+typedef struct __attribute__((packed)) {
     struct Header header;
     uint8_t data[MAX_PACKET_SIZE];
 } RxBuffer;

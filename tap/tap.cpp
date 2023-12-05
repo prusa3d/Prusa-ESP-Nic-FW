@@ -34,6 +34,9 @@ class Tap {
         // static constexpr speed_t BAUDRATE = 4705882; // Optimal for 40Mhz ESP8266 crystal
         // static constexpr speed_t BAUDRATE = 4588235; // Optimal for 26Mhz ESP8266 crystal
         static constexpr speed_t BAUDRATE = 4647059; // Compromise
+        // static constexpr speed_t BAUDRATE = 115200 * 40;
+        // static constexpr speed_t BAUDRATE = 1000000; // Safe
+        // static constexpr speed_t BAUDRATE = 115200; // Ultrasafe
 
         void run(const char* tty_device) {
             std::cout << "Starting up" << std::endl;

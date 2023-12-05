@@ -12,23 +12,47 @@
 
 #include "uart0_driver.h"
 
+// #ifdef CONFIG_IDF_TARGET_ESP8266 
+// #define USE_CUSTOM_UART_DRIVER
+// #endif
+
 #include "driver/uart.h"
+#ifdef CONFIG_IDF_TARGET_ESP8266
 #include "esp8266/pin_mux_register.h"
 #include "esp8266/uart_register.h"
 #include "esp8266/uart_struct.h"
+#include "projdefs.h"
+#endif
+#ifdef CONFIG_IDF_TARGET_ESP32
+#include "soc/uart_reg.h"
+#include "soc/uart_struct.h"
+#include "soc/io_mux_reg.h"
+#define uart0 UART0
+#endif
 #include "esp_attr.h"
 #include "esp_log.h"
-#include "projdefs.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <arpa/inet.h>
 
+const uint32_t baud_rate = 4608000;
+// const uint32_t baud_rate = 115200;
+
+static const char *TAG = "uart_driver";
+
+static uint8_t intron[8];
+
+void IRAM_ATTR uart0_set_intron(uint8_t new_intron[8]) {
+    memcpy(intron, new_intron, sizeof(intron));
+}
+
+#ifdef USE_CUSTOM_UART_DRIVER
+
 const uint32_t rxfifo_full_thresh = 96;
 const uint32_t rx_timeout_thresh = 16;
 const uint32_t txfifo_empty_thresh = 32;
-const uint32_t baud_rate = 4608000;
 
 static TaskHandle_t tx_task_handle; // task to be notified after uart0_isr() finishes transmit
 static uint8_t *tx_data;
@@ -37,8 +61,6 @@ static size_t tx_size;
 static atomic_bool pending_frm_err = false;
 static atomic_bool pending_parity_err = false;
 static atomic_bool pending_rxfifo_ovf = false;
-
-static const char *TAG = "uart_driver";
 
 #define FORCE_INLINE inline __attribute__((always_inline))
 
@@ -140,9 +162,9 @@ void IRAM_ATTR uart0_tx_bytes(uint8_t *data, size_t size) {
         tx_size = size - tx_remain_fifo_cnt;
 
         // delegate rest of the work to interrupt handler
-        taskENTER_CRITICAL();
+        custom_taskENTER_CRITICAL(&critical_mutex);
         uart0.int_ena.txfifo_empty = 1;
-        taskEXIT_CRITICAL();
+        custom_taskEXIT_CRITICAL(&critical_mutex);
 
         // wait for interrupt handler and we are done
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -152,11 +174,6 @@ void IRAM_ATTR uart0_tx_bytes(uint8_t *data, size_t size) {
     }
 }
 
-static uint8_t intron_pos = 0;
-
-static uint8_t intron[8];
-
-
 QueueHandle_t empty_buffer_queue;
 QueueHandle_t full_buffer_queue;
 
@@ -164,6 +181,7 @@ BaseType_t IRAM_ATTR handle_fifo_byte(const char c) {
     static RxBuffer *rx_buffer = NULL;
     static size_t rx_buffer_pos = 0;
     static size_t rx_buffer_size = 0;
+    static uint8_t intron_pos = 0;
 
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
@@ -247,15 +265,15 @@ RxBuffer* IRAM_ATTR uart0_rx_get_buffer() {
     return buffer;
 }
 
-void IRAM_ATTR uart0_set_intron(uint8_t new_intron[8]) {
-    memcpy(intron, new_intron, sizeof(intron));
-}
-
 static uint32_t round_div(uint32_t a, uint32_t b) {
     return (a + b/2) / b;
 }
 
 esp_err_t uart0_driver_install(TaskHandle_t uart0_tx_task_handle) {
+#ifdef CONFIG_IDF_TARGET_ESP32
+    uart_set_pin(UART_NUM_0, 1, 3, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+#endif
+
     if (uart_is_driver_installed(UART_NUM_0)) {
         return ESP_FAIL;
     }
@@ -273,10 +291,17 @@ esp_err_t uart0_driver_install(TaskHandle_t uart0_tx_task_handle) {
         xQueueSendToBack( empty_buffer_queue, &buffer, portMAX_DELAY );
     }
 
-    portENTER_CRITICAL();
+    custom_taskENTER_CRITICAL(&critical_mutex);
+#ifdef CONFIG_IDF_TARGET_ESP8266
     PIN_PULLUP_DIS(PERIPHS_IO_MUX_U0TXD_U);
     PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0RXD_U, FUNC_U0RXD);
     PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0TXD_U, FUNC_U0TXD);
+#endif
+#ifdef CONFIG_IDF_TARGET_ESP32
+    PIN_PULLUP_DIS(PERIPHS_IO_MUX_U0TXD_U);
+    PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0RXD_U, FUNC_U0RXD_U0RXD);
+    PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0TXD_U, FUNC_U0TXD_U0TXD);
+#endif
     uart0.clk_div.val = round_div(UART_CLK_FREQ, baud_rate) & 0xFFFFF;
     uart0.conf0.bit_num = UART_DATA_8_BITS;
     uart0.conf0.parity = (UART_PARITY_DISABLE & 0x1);
@@ -288,24 +313,109 @@ esp_err_t uart0_driver_install(TaskHandle_t uart0_tx_task_handle) {
     uart0.conf1.rx_tout_thrhd = (rx_timeout_thresh & 0x7f);
     uart0.conf1.rxfifo_full_thrhd = rxfifo_full_thresh;
     uart0.conf1.txfifo_empty_thrhd = txfifo_empty_thresh;
-    portEXIT_CRITICAL();
+    custom_taskEXIT_CRITICAL(&critical_mutex);
 
     // Note: We plug into original ISR in order to keep UART_NUM_1 working.
+    #if CONFIG_IDF_TARGET_ESP32
+    if (uart_isr_register(UART_NUM_0, uart0_isr, NULL, 0, NULL) != ESP_OK) {
+    #endif
+    #if CONFIG_IDF_TARGET_ESP8266
     if (uart_isr_register(UART_NUM_0, uart0_isr, NULL) != ESP_OK) {
+    #endif
         return ESP_FAIL;
     }
 
     tx_task_handle = uart0_tx_task_handle;
     xTaskNotifyGive(tx_task_handle);
 
-    taskENTER_CRITICAL();
+    custom_taskENTER_CRITICAL(&critical_mutex);
     uart0.int_ena.rxfifo_full = 1;
     uart0.int_ena.rxfifo_tout = 1;
     uart0.int_ena.parity_err = 1;
     uart0.int_ena.frm_err = 1;
     uart0.int_ena.rxfifo_ovf = 1;
-    taskEXIT_CRITICAL();
+    custom_taskEXIT_CRITICAL(&critical_mutex);
 
 
     return ESP_OK;
 }
+
+#else // Simplified implementation without custom UART driver
+
+
+esp_err_t uart0_driver_install(TaskHandle_t uart0_tx_task_handle) {
+#ifdef CONFIG_IDF_TARGET_ESP32
+    uart_set_pin(UART_NUM_0, 1, 3, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+#endif
+
+    // Configure parameters of an UART driver,
+    // communication pins and install the driver
+    uart_config_t uart_config = {
+        .baud_rate = baud_rate,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    uart_driver_install(UART_NUM_0, 16384, 16384, 0, NULL, 0);
+    uart_param_config(UART_NUM_0, &uart_config);
+ 
+    // Report driver is installed
+    xTaskNotifyGive(uart0_tx_task_handle);
+
+    return ESP_OK;
+}
+
+void uart0_tx_bytes(uint8_t *data, size_t size) {
+    uart_write_bytes(UART_NUM_0, (const char *)data, size);
+}
+
+static void IRAM_ATTR wait_for_intron() {
+    // ESP_LOGI(TAG, "Waiting for intron");
+    uint pos = 0;
+    bool failure = false;
+    while(pos < sizeof(intron)) {
+        uint8_t c;
+        int read = uart_read_bytes(UART_NUM_0, &c, sizeof(c), portMAX_DELAY);
+        if(read == sizeof(c)) {
+            if (c == intron[pos]) {
+                pos++;
+            } else {
+                // ESP_LOGI(TAG, "Invalid: %c, val: %d\n", c, (int)c);
+                pos = 0;
+                failure = true;
+            }
+        } else {
+            ESP_LOGI(TAG, "Timeout!!!");
+        }
+    }
+    if(failure) {
+        ESP_LOGI(TAG, "Intron found fter failure");
+    }
+}
+
+
+RxBuffer* uart0_rx_get_buffer() {
+    RxBuffer *buffer = malloc(sizeof(RxBuffer));
+    assert(buffer);
+
+    wait_for_intron();
+
+    uart_read_bytes(UART_NUM_0, (uint8_t*)buffer, sizeof(struct Header), portMAX_DELAY);
+    const size_t size = ntohs(buffer->header.size);
+    if(size < MAX_PACKET_SIZE) {
+        uart_read_bytes(UART_NUM_0, (uint8_t*)buffer + sizeof(struct Header), size, portMAX_DELAY);
+        return buffer;
+    } else {
+        free(buffer);
+        return NULL;
+    }
+}
+
+void uart0_rx_release_buffer(RxBuffer *buffer) {
+    free(buffer);
+}
+
+
+
+#endif

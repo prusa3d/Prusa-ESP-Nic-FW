@@ -33,7 +33,9 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
+#ifdef CONFIG_IDF_TARGET_ESP8266
 #include "esp_aio.h"
+#endif
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -41,11 +43,18 @@
 #include "uart0_driver.h"
 
 #include "esp_private/wifi.h"
+#ifdef CONFIG_IDF_TARGET_ESP8266
 #include "esp_supplicant/esp_wpa.h"
-
+#endif
+#ifdef CONFIG_IDF_TARGET_ESP32
+#include "esp_wpa.h"
+#endif
+#include <arpa/inet.h>
 
 // Externals with no header
+#ifdef CONFIG_IDF_TARGET_ESP8266
 int ieee80211_output_pbuf(esp_aio_t *aio);
+#endif
 esp_err_t mac_init(void);
 
 #define FW_VERSION 11
@@ -62,6 +71,15 @@ static const uint16_t INACTIVE_BEACON_SECONDS = 3600 * 18;
 // TODO: Shall we generate something to provoke getting some packets? Like ARP
 // pings to the AP?
 static const uint32_t INACTIVE_PACKET_SECONDS = 5;
+
+#define CONFIG_ESP_MAXIMUM_RETRY 5
+
+#ifdef CONFIG_IDF_TARGET_ESP8266
+int critical_mutex = 0;
+#endif
+#ifdef CONFIG_IDF_TARGET_ESP32
+portMUX_TYPE critical_mutex = portMUX_INITIALIZER_UNLOCKED;
+#endif
 
 // Note: Values 1..5 are deprecated and must not be used.
 #define MSG_DEVINFO_V2 0
@@ -206,7 +224,7 @@ static void IRAM_ATTR event_handler(void* arg, esp_event_base_t event_base, int3
             }
             if (beacon_quirk && !found) {
                 for (int i = 0; i < ap_count; ++i) {
-                    if (ap_info.ssid && ap_info.ssid[0] && aps[i].ssid && aps[i].ssid[0]) {
+                    if (aps[i].ssid[0]) {
                         if (0 == strncmp((char *)(ap_info.ssid), (char *)(aps[i].ssid), 32)) {
                             found = true;
                             break;
@@ -246,6 +264,8 @@ static int IRAM_ATTR wifi_receive_cb(void *buffer, uint16_t len, void *eb) {
         }
     }
 
+    ESP_LOGI(TAG, "wifi packet: %u B", len);
+
     struct uart0_tx_queue_item queue_item;
     queue_item.header.type = MSG_PACKET_V2;
     queue_item.header.up = get_link_status();
@@ -258,16 +278,23 @@ static int IRAM_ATTR wifi_receive_cb(void *buffer, uint16_t len, void *eb) {
         return ESP_OK;
     }
 cleanup:
+#ifdef CONFIG_IDF_TARGET_ESP8266
     free(buffer);
+#endif
     esp_wifi_internal_free_rx_buffer(eb);
     return ESP_FAIL;
 }
 
 void IRAM_ATTR wifi_init_sta(void) {
+#ifdef CONFIG_IDF_TARGET_ESP32
+    esp_wifi_power_domain_on();
+#endif
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+#ifdef CONFIG_IDF_TARGET_ESP8266
     ESP_ERROR_CHECK(mac_init());
     esp_wifi_set_rx_pbuf_mem_type(WIFI_RX_PBUF_DRAM);
+#endif
     ESP_ERROR_CHECK(esp_wifi_init_internal(&cfg));
     ESP_ERROR_CHECK(esp_supplicant_init());
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
@@ -299,6 +326,7 @@ static int IRAM_ATTR get_link_status() {
 }
 
 static void IRAM_ATTR handle_rx_msg_packet_v2(RxBuffer *buffer, size_t size) {
+    ESP_LOGI(TAG, "uart packet: %u B", size);
     if (size == 0) {
         send_link_status(get_link_status());
     } else {
@@ -313,10 +341,10 @@ static void IRAM_ATTR handle_rx_msg_clientconfig_v2(RxBuffer *buffer, size_t siz
     uint8_t *data = buffer->data;
 
     {
-        taskENTER_CRITICAL();
+        custom_taskENTER_CRITICAL(&critical_mutex);
         memcpy(tx_message.intron, data, sizeof(tx_message.intron));
         uart0_set_intron(tx_message.intron);
-        taskEXIT_CRITICAL();
+        custom_taskEXIT_CRITICAL(&critical_mutex);
         data += sizeof(tx_message.intron);
     }
     {
@@ -337,6 +365,11 @@ static void IRAM_ATTR handle_rx_msg_clientconfig_v2(RxBuffer *buffer, size_t siz
         memcpy(wifi_config.sta.password, data, memcpy_size);
         data += password_length;
     }
+
+    ESP_LOGI(TAG, "Setting WiFi configuration");
+    ESP_LOGI(TAG, "SSID: %s", wifi_config.sta.ssid);
+    ESP_LOGI(TAG, "PASS: %s", wifi_config.sta.password);
+    ESP_LOGI(TAG, "INTRON: %s", tx_message.intron);
 
     /* Setting a password implies station will connect to all security modes including WEP/WPA.
         * However these modes are deprecated and not advisable to be used. Incase your Access point
@@ -445,7 +478,9 @@ static void IRAM_ATTR uart0_tx_task(void *arg) {
                 uint16_t size = ntohs(queue_item.header.size);
                 if (size) {
                     uart0_tx_bytes(queue_item.data, size);
+#ifdef CONFIG_IDF_TARGET_ESP8266
                     free(queue_item.data);
+#endif
                 }
                 if (queue_item.rx_buffer) {
                     esp_wifi_internal_free_rx_buffer(queue_item.rx_buffer);
@@ -465,7 +500,7 @@ static void IRAM_ATTR uart0_tx_task(void *arg) {
 void IRAM_ATTR app_main() {
     ESP_LOGI(TAG, "UART NIC");
 
-	esp_log_level_set("*", ESP_LOG_ERROR);
+	// esp_log_level_set("*", ESP_LOG_ERROR);
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
@@ -486,7 +521,7 @@ void IRAM_ATTR app_main() {
     }
 
     TaskHandle_t uart0_tx_task_handle;
-    if (xTaskCreate(uart0_tx_task, "uart0tx", 1024, NULL, 14, &uart0_tx_task_handle) != pdPASS) {
+    if (xTaskCreate(uart0_tx_task, "uart0tx", 4096, NULL, 14, &uart0_tx_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate failed (uart0tx)");
         abort();
     }
@@ -497,7 +532,7 @@ void IRAM_ATTR app_main() {
     }
     uart0_set_intron(tx_message.intron);
 
-    if (xTaskCreate(uart0_rx_task, "uart0rx", 1024, NULL, 14, NULL) != pdPASS) {
+    if (xTaskCreate(uart0_rx_task, "uart0rx", 4096, NULL, 14, NULL) != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate failed (uart0rx)");
         abort();
     }
