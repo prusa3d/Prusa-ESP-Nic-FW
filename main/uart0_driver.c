@@ -44,8 +44,56 @@ static const char *TAG = "uart_driver";
 
 static uint8_t intron[8];
 
+QueueHandle_t empty_buffer_queue;
+QueueHandle_t full_buffer_queue;
+
+static atomic_bool pending_frm_err = false;
+static atomic_bool pending_parity_err = false;
+static atomic_bool pending_rxfifo_ovf = false;
+
 void IRAM_ATTR uart0_set_intron(uint8_t new_intron[8]) {
     memcpy(intron, new_intron, sizeof(intron));
+}
+
+void IRAM_ATTR uart0_rx_release_buffer(RxBuffer *buffer) {
+    xQueueSendToBack( empty_buffer_queue, &buffer, portMAX_DELAY );
+}
+
+RxBuffer* IRAM_ATTR uart0_rx_get_buffer() {
+    RxBuffer *buffer;
+    xQueueReceive( full_buffer_queue, &buffer, portMAX_DELAY );
+    // uart1.fifo.rw_byte = '*';
+
+    // Report problems that emerged during the transfer.
+    if(pending_frm_err) {
+        pending_frm_err = false;
+        ESP_LOGE(TAG, "UART0 frame error");
+    }
+    if (pending_parity_err) {
+        pending_parity_err = false;
+        ESP_LOGE(TAG, "UART0 parity error");
+    }
+    if(pending_rxfifo_ovf) {
+        pending_rxfifo_ovf = false;
+        ESP_LOGE(TAG, "UART0 RX FIFO overflow");
+    }
+
+    return buffer;
+}
+
+static void setup_queues() {
+     // Rx, Tx queues
+    empty_buffer_queue = xQueueCreate( 10, sizeof(RxBuffer*));
+    assert(empty_buffer_queue);
+    full_buffer_queue = xQueueCreate( 10, sizeof(RxBuffer*));
+    assert(full_buffer_queue);
+
+    // Allocate Tx buffers
+    for(int _ = 0; _ < 3; _++) {
+        RxBuffer *buffer = malloc(sizeof(RxBuffer));
+        assert(buffer);
+        xQueueSendToBack( empty_buffer_queue, &buffer, portMAX_DELAY );
+    }
 }
 
 #ifdef USE_CUSTOM_UART_DRIVER
@@ -57,10 +105,6 @@ const uint32_t txfifo_empty_thresh = 32;
 static TaskHandle_t tx_task_handle; // task to be notified after uart0_isr() finishes transmit
 static uint8_t *tx_data;
 static size_t tx_size;
-
-static atomic_bool pending_frm_err = false;
-static atomic_bool pending_parity_err = false;
-static atomic_bool pending_rxfifo_ovf = false;
 
 #define FORCE_INLINE inline __attribute__((always_inline))
 
@@ -174,9 +218,6 @@ void IRAM_ATTR uart0_tx_bytes(uint8_t *data, size_t size) {
     }
 }
 
-QueueHandle_t empty_buffer_queue;
-QueueHandle_t full_buffer_queue;
-
 BaseType_t IRAM_ATTR handle_fifo_byte(const char c) {
     static RxBuffer *rx_buffer = NULL;
     static size_t rx_buffer_pos = 0;
@@ -239,32 +280,6 @@ void IRAM_ATTR read_fifo() {
     }
 }
 
-void IRAM_ATTR uart0_rx_release_buffer(RxBuffer *buffer) {
-    xQueueSendToBack( empty_buffer_queue, &buffer, portMAX_DELAY );
-}
-
-RxBuffer* IRAM_ATTR uart0_rx_get_buffer() {
-    RxBuffer *buffer;
-    xQueueReceive( full_buffer_queue, &buffer, portMAX_DELAY );
-    // uart1.fifo.rw_byte = '*';
-
-    // Report problems that emerged during the transfer.
-    if(pending_frm_err) {
-        pending_frm_err = false;
-        ESP_LOGE(TAG, "UART0 frame error");
-    }
-    if (pending_parity_err) {
-        pending_parity_err = false;
-        ESP_LOGE(TAG, "UART0 parity error");
-    }
-    if(pending_rxfifo_ovf) {
-        pending_rxfifo_ovf = false;
-        ESP_LOGE(TAG, "UART0 RX FIFO overflow");
-    }
-
-    return buffer;
-}
-
 static uint32_t round_div(uint32_t a, uint32_t b) {
     return (a + b/2) / b;
 }
@@ -278,18 +293,7 @@ esp_err_t uart0_driver_install(TaskHandle_t uart0_tx_task_handle) {
         return ESP_FAIL;
     }
 
-    // Rx, Tx queues
-    empty_buffer_queue = xQueueCreate( 10, sizeof(RxBuffer*));
-    assert(empty_buffer_queue);
-    full_buffer_queue = xQueueCreate( 10, sizeof(RxBuffer*));
-    assert(full_buffer_queue);
-
-    // Allocate Tx buffers
-    for(int _ = 0; _ < 3; _++) {
-        RxBuffer *buffer = malloc(sizeof(RxBuffer));
-        assert(buffer);
-        xQueueSendToBack( empty_buffer_queue, &buffer, portMAX_DELAY );
-    }
+    setup_queues();
 
     custom_taskENTER_CRITICAL(&critical_mutex);
 #ifdef CONFIG_IDF_TARGET_ESP8266
@@ -342,36 +346,8 @@ esp_err_t uart0_driver_install(TaskHandle_t uart0_tx_task_handle) {
 
 #else // Simplified implementation without custom UART driver
 
-
-esp_err_t uart0_driver_install(TaskHandle_t uart0_tx_task_handle) {
-#ifdef CONFIG_IDF_TARGET_ESP32
-    uart_set_pin(UART_NUM_0, 1, 3, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-#endif
-
-    // Configure parameters of an UART driver,
-    // communication pins and install the driver
-    uart_config_t uart_config = {
-        .baud_rate = baud_rate,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
-    };
-    uart_driver_install(UART_NUM_0, 16384, 16384, 0, NULL, 0);
-    uart_param_config(UART_NUM_0, &uart_config);
- 
-    // Report driver is installed
-    xTaskNotifyGive(uart0_tx_task_handle);
-
-    return ESP_OK;
-}
-
-void uart0_tx_bytes(uint8_t *data, size_t size) {
-    uart_write_bytes(UART_NUM_0, (const char *)data, size);
-}
-
 static void IRAM_ATTR wait_for_intron() {
-    // ESP_LOGI(TAG, "Waiting for intron");
+    ESP_LOGI(TAG, "Waiting for intron");
     uint pos = 0;
     bool failure = false;
     while(pos < sizeof(intron)) {
@@ -390,32 +366,74 @@ static void IRAM_ATTR wait_for_intron() {
         }
     }
     if(failure) {
-        ESP_LOGI(TAG, "Intron found fter failure");
+        ESP_LOGI(TAG, "Intron found after failure");
     }
 }
 
+static void IRAM_ATTR rx_task(void *arg) {
+    for(;;) {
+        RxBuffer *rx_buffer = NULL;
+ 
+        // Obtain buffer
+        ESP_LOGI(TAG, "Waiting for buffer");
+        xQueueReceive(empty_buffer_queue, &rx_buffer, portMAX_DELAY);
+        ESP_LOGI(TAG, "Got buffer");
+        assert(rx_buffer);
 
-RxBuffer* uart0_rx_get_buffer() {
-    RxBuffer *buffer = malloc(sizeof(RxBuffer));
-    assert(buffer);
+        // Wait for intron
+        wait_for_intron();
 
-    wait_for_intron();
+        // Read header
+        uart_read_bytes(UART_NUM_0, (uint8_t*)rx_buffer, sizeof(struct Header), portMAX_DELAY);
+        const size_t size = ntohs(rx_buffer->header.size);
+        if(size < MAX_PACKET_SIZE) {
+            // Read body
+            uart_read_bytes(UART_NUM_0, (uint8_t*)rx_buffer + sizeof(struct Header), size, portMAX_DELAY);
 
-    uart_read_bytes(UART_NUM_0, (uint8_t*)buffer, sizeof(struct Header), portMAX_DELAY);
-    const size_t size = ntohs(buffer->header.size);
-    if(size < MAX_PACKET_SIZE) {
-        uart_read_bytes(UART_NUM_0, (uint8_t*)buffer + sizeof(struct Header), size, portMAX_DELAY);
-        return buffer;
-    } else {
-        free(buffer);
-        return NULL;
+            // Dispatch buffer
+            ESP_LOGI(TAG, "Dispatching buffer");
+            xQueueSendToBack( full_buffer_queue, &rx_buffer, portMAX_DELAY );
+        } else {
+            // Skip this message
+            ESP_LOGI(TAG, "Skipping message");
+            xQueueSendToBack( empty_buffer_queue, &rx_buffer, portMAX_DELAY );
+        }
     }
 }
 
-void uart0_rx_release_buffer(RxBuffer *buffer) {
-    free(buffer);
+esp_err_t uart0_driver_install(TaskHandle_t uart0_tx_task_handle) {
+#ifdef CONFIG_IDF_TARGET_ESP32
+    uart_set_pin(UART_NUM_0, 1, 3, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+#endif
+
+    // Configure parameters of an UART driver,
+    // communication pins and install the driver
+    uart_config_t uart_config = {
+        .baud_rate = baud_rate,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    uart_driver_install(UART_NUM_0, 16384, 0, 0, NULL, 0);
+    uart_param_config(UART_NUM_0, &uart_config);
+
+    setup_queues();
+
+    // Start UART reader thread
+    if (xTaskCreate(rx_task, "uart_rx", 2048, NULL, 16, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate failed (uart_rx)");
+        abort();
+    }
+ 
+    // Report driver is installed
+    xTaskNotifyGive(uart0_tx_task_handle);
+
+    return ESP_OK;
 }
 
-
+void uart0_tx_bytes(uint8_t *data, size_t size) {
+    uart_write_bytes(UART_NUM_0, (const char *)data, size);
+}
 
 #endif

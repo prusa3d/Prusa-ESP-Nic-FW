@@ -204,7 +204,7 @@ class Tap {
         }
 
         void recv_packet() {
-            // std::cout << "TTY: Reading packet" << std::endl;
+            std::cout << "TTY: Reading packet" << std::endl;
             bool up = get_tty<bool>();
             recv_link(up);
             uint16_t raw_size = get_tty<uint16_t>();
@@ -281,7 +281,7 @@ class Tap {
                 std::vector<uint8_t> buffer(MTU + 18);
                 ssize_t len = read(tap, buffer.data(), buffer.size());
                 if(len > 0) {
-                    // std::cout << "TAP: " << len << " bytes read" << std::endl;
+                    std::cout << "TAP: " << len << " bytes read" << std::endl;
                     buffer.resize(len);
                     send_message(Msg::PACKET_V2, 0, buffer);
                 }

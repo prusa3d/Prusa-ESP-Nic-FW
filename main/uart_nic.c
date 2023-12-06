@@ -331,8 +331,8 @@ static void IRAM_ATTR handle_rx_msg_packet_v2(RxBuffer *buffer, size_t size) {
         send_link_status(get_link_status());
     } else {
         esp_wifi_internal_tx(ESP_IF_WIFI_STA, buffer->data, size);
-        uart0_rx_release_buffer(buffer);
     }
+    uart0_rx_release_buffer(buffer);
 }
 
 static void IRAM_ATTR handle_rx_msg_clientconfig_v2(RxBuffer *buffer, size_t size) {
